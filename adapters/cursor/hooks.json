@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeMCPExecution": [
+      {
+        "command": "python3 <이 저장소 절대경로>/core/hangul_corruption_guard.py",
+        "failClosed": true
+      }
+    ]
+  }
+}

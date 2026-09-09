@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 <이 저장소 절대경로>/core/hangul_corruption_guard.py"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -198,24 +198,26 @@ def resolve_marker(cwd, rel, first=None, last=None):
         try:
             text = open(path, encoding="utf-8").read()
         except Exception:
-            return path, None
+            return path, None, "read"
         if first is None:
-            return path, text
+            return path, text, None
         lines = text.splitlines()
         start = first - 1
         end = (last if last is not None else first)
         if start < 0 or end > len(lines) or start >= end:
-            return path, None          # 범위 밖 — 조용히 통과시키지 않는다
-        return path, "\n".join(lines[start:end])
-    return None, None
+            # 범위 밖 — 조용히 통과시키지 않는다. 사유를 구분해야 진단이 엉뚱한 곳을 짚지 않는다
+            return path, None, f"range:{len(lines)}"
+        return path, "\n".join(lines[start:end]), None
+    return None, None, "path"
 
 
-def expand_markers(node, cwd, misses, used=None):
+def expand_markers(node, cwd, misses, used=None, ranged=None, path="tool_input"):
     """@@hangul:경로@@ 를 파일 내용으로 치환한 사본을 돌려준다.
 
-    이유는 두 가지다. (1) 본문이 모델 토큰을 한 번도 거치지 않으므로 그 구간의
-    표류가 원천적으로 불가능하다. (2) 같은 본문을 파일과 파라미터에 두 번 쓰지
-    않으므로 토큰이 크게 준다(실측 80%, 이스케이프 배율 약 4배가 사라진다).
+    이유는 두 가지다. (1) 본문이 파라미터 경로에서는 모델 토큰을 거치지 않으므로
+    그 구간의 재전송 표류가 사라진다(기준본을 쓰는 단계는 남는다). (2) 같은 본문을
+    파일과 파라미터에 두 번 쓰지 않으므로 토큰이 준다(이스케이프 대비 실측 80%,
+    리터럴 대비로는 거의 본전 — 이득은 반복 전송에서 난다).
     """
     if isinstance(node, str):
         hit = MARKER.match(node.strip())
@@ -224,27 +226,46 @@ def expand_markers(node, cwd, misses, used=None):
         rel = hit.group(1).strip()
         first = int(hit.group(2)) if hit.group(2) else None
         last = int(hit.group(3)) if hit.group(3) else None
-        path, text = resolve_marker(cwd, rel, first, last)
+        found, text, reason = resolve_marker(cwd, rel, first, last)
+        span = "" if first is None else f"#L{first}" + (f"-L{last}" if last else "")
         if text is None:
-            span = "" if first is None else f"#L{first}" + (f"-L{last}" if last else "")
-            misses.append(rel + span)
+            misses.append((rel + span, reason, found))
             return node, False
         if used is not None:
-            used.append((path, os.path.getmtime(path), len(text)))
+            used.append((found, os.path.getmtime(found), len(text)))
+        if ranged is not None and first is not None:
+            # 통짜 교체 필드에 줄 범위를 쓰면 나머지 본문이 조용히 삭제된다 — main 에서 막는다
+            ranged.append((path, rel + span))
         return text.rstrip("\n"), True
     if isinstance(node, dict):
         out, changed = {}, False
         for key, value in node.items():
-            out[key], hit = expand_markers(value, cwd, misses, used)
+            out[key], hit = expand_markers(value, cwd, misses, used, ranged, f"{path}.{key}")
             changed = changed or hit
         return out, changed
     if isinstance(node, list):
         out, changed = [], False
-        for value in node:
-            item, hit = expand_markers(value, cwd, misses, used)
+        for index, value in enumerate(node):
+            item, hit = expand_markers(value, cwd, misses, used, ranged, f"{path}[{index}]")
             out.append(item); changed = changed or hit
         return out, changed
     return node, False
+
+
+def leftover_markers(node):
+    """치환되지 않고 남은 마커 문자열. 이대로 나가면 본문 대신 마커가 저장된다.
+    MARKER 는 ^...$ 앵커라 형태가 조금만 어긋나도 치환되지 않고 조용히 통과한다."""
+    out = []
+    if isinstance(node, str):
+        if "@@hangul:" in node:
+            out.append(node.strip()[:120])
+    elif isinstance(node, dict):
+        for value in node.values():
+            out += leftover_markers(value)
+    elif isinstance(node, list):
+        for value in node:
+            out += leftover_markers(value)
+    return out
 
 
 def emit_updated(tool_input):
@@ -387,17 +408,59 @@ def main():
 
     tool_name, tool_input, cwd, session = extract_call(data)
     if not any(marker in tool_name for marker in GATED):
+        # 화이트리스트 밖에서는 치환이 돌지 않는다. 마커를 보냈다면 그대로 저장되므로 막는다
+        stray = leftover_markers(tool_input)
+        if stray:
+            deny(f"{tool_name} 은 이 훅의 검사 대상이 아니라 마커가 치환되지 않습니다:\n"
+                 + "\n".join(f"  {v}" for v in stray)
+                 + "\n\n이대로 보내면 본문 대신 마커 문자열이 저장됩니다."
+                   " 본문을 직접 보내세요.\n")
         sys.exit(0)
 
     # 마커 치환을 먼저 한다 — 이후 모든 검사는 치환된 본문에 대해 돌아야
     # 치환이 검사를 우회하는 구멍이 되지 않는다
-    misses, used_files = [], []
-    expanded, did_expand = expand_markers(tool_input, cwd, misses, used_files)
+    misses, used_files, ranged = [], [], []
+    expanded, did_expand = expand_markers(tool_input, cwd, misses, used_files, ranged)
+    for spec, reason, found in misses:
+        if reason and reason.startswith("range:"):
+            deny(f"마커의 줄 범위가 파일을 벗어납니다: @@hangul:{spec}@@\n"
+                 f"  {found} 는 {reason.split(':')[1]}줄입니다.\n\n"
+                 "줄 번호는 1부터이고 끝 줄을 포함합니다. `grep -n` 으로 확인하세요.\n")
+        if reason == "read":
+            deny(f"기준본 파일을 읽지 못했습니다: {found}\n"
+                 "  UTF-8 로 저장돼 있는지 확인하세요.\n")
     if misses:
         deny("기준본 파일을 찾을 수 없습니다: "
-             + ", ".join(f"@@hangul:{m}@@" for m in misses)
+             + ", ".join(f"@@hangul:{m}@@" for m, _r, _f in misses)
              + f"\n  찾은 위치: {staging_dirs(cwd)[0]}\n"
                "  경로는 staging 폴더 기준 상대경로여야 하고, 폴더 밖은 거부합니다.\n")
+
+    # 형태가 어긋나 치환되지 않은 마커. 그대로 나가면 본문 대신 마커가 저장된다
+    stray = leftover_markers(expanded)
+    if stray:
+        deny("치환되지 않은 마커가 남아 있습니다:\n"
+             + "\n".join(f"  {v}" for v in stray)
+             + "\n\n마커는 문자열 **전체**가 @@hangul:<경로>@@ 형태일 때만 치환합니다.\n"
+               "  줄 지정은 #L12 · #L12-L15 형태입니다 — #L12-15 · #12 는 인식하지 않습니다.\n"
+               "  앞뒤에 다른 글자가 붙거나 본문 중간에 끼워 넣은 것도 치환하지 않습니다.\n"
+               "이대로 보내면 본문 대신 마커 문자열이 저장됩니다.\n")
+
+    # 통짜 교체 필드에 줄 범위 마커를 쓰면 지정한 줄만 남고 나머지가 조용히 사라진다
+    if ranged:
+        whole = {path for path, _v in full_body_values(tool_name, expanded)}
+        for path, spec in ranged:
+            if path in whole:
+                deny(f"[{path}] 본문을 통째로 바꾸는 필드에는 줄 지정 마커를 쓸 수 없습니다"
+                     f" (@@hangul:{spec}@@).\n\n"
+                     "지정한 줄만 남고 나머지 본문은 에러 없이 삭제됩니다.\n"
+                     "보낼 본문 전체를 파일 하나로 만들어 파일 전체 마커로 보내세요"
+                     " — @@hangul:target/<문서 id>.md@@\n")
+    # 치환 자체를 지원하지 않는 호스트라면 다른 진단보다 먼저 알려야 한다 —
+    # stale 을 먼저 띄우면 파일을 갱신하고 나서야 진짜 사유를 보게 된다
+    if did_expand and isinstance(data.get("tool_info"), dict):
+        deny("이 도구는 훅이 입력을 치환하는 기능을 지원하지 않습니다"
+             " (Windsurf 는 허용/차단만 가능).\n마커 대신 본문을 직접 보내세요.\n")
+
     # 마커가 가리키는 파일이 오래됐으면 한 번 확인을 받는다.
     # 훅은 서버 본문을 볼 수 없어 "내용이 최신인가" 는 판정할 수 없다 — 나이만 알 수 있다.
     if used_files:
@@ -405,7 +468,7 @@ def main():
                  if (time.time() - m) / 3600 >= STALE_HOURS]
         if stale:
             digest = hashlib.sha256(
-                ("stale\x00" + (data.get("session_id") or "") + "\x00"
+                ("stale\x00" + session + "\x00"
                  + "\x00".join(f"{p}:{m}" for p, m, _n in used_files)).encode("utf-8")
             ).hexdigest()[:32]
             marker_path = os.path.join(CACHE, digest)
@@ -418,9 +481,6 @@ def main():
                        " 훅은 서버를 볼 수 없어 내용이 최신인지는 판정하지 못합니다.\n"
                        "다시 fetch 해서 갱신하거나, 그대로 보낼 것이면 같은 호출을 한 번 더 하세요.\n")
 
-    if did_expand and isinstance(data.get("tool_info"), dict):
-        deny("이 도구는 훅이 입력을 치환하는 기능을 지원하지 않습니다"
-             " (Windsurf 는 허용/차단만 가능).\n마커 대신 본문을 직접 보내세요.\n")
     tool_input = expanded
 
     targets = collect(tool_input)
@@ -473,7 +533,10 @@ def main():
              f"  기준본:  {best[1]}\n  보낸 값: {line.strip()}\n\n"
              + "\n".join(diff_marks(best[0], norm))
              + "\n\nold_str 은 페이지에 있는 그대로여야 합니다 — 옮기는 중에 글자가 어긋난 것으로"
-               " 보입니다.\n기준본 쪽 문자열을 그대로 보내세요."
+               " 보입니다.\n"
+               f"옮겨 적지 말고 줄 지정 마커로 보내세요: @@hangul:current/{ident}.md#L<줄>@@\n"
+               "  (줄 번호는 그 파일에서 `grep -n` 으로 확인합니다)\n"
+               "마커를 쓸 수 없으면 기준본 쪽 문자열을 그대로 보내세요."
                " 서버 본문이 그 사이 바뀐 것이라면 current/ 를 다시 받아 두세요.\n")
 
     new_content = []
@@ -502,7 +565,11 @@ def main():
                 deny(f"[{path}] 기준본과 길이가 같은데 {len(diffs)}글자가 다릅니다 — 표류로 보입니다.\n\n"
                      f"  기준본:  {cand_orig}\n  보낸 값: {line.strip()}\n\n"
                      + "\n".join(marks)
-                     + "\n\n기준본 쪽 문자열을 그대로 보내세요."
+                     + "\n\n이 값 전체가 기준본 파일의 한 구간과 같아질 수 있으면, 옮겨 적지 말고"
+                       " 마커로 보내세요\n"
+                       "  (파일 전체 @@hangul:current/<문서 id>.md@@"
+                       " · 줄 지정 @@hangul:current/<문서 id>.md#L12-L15@@).\n"
+                       "그렇지 않으면 기준본 쪽 문자열을 그대로 보내세요."
                        " 의도한 수정이라면 기준본을 먼저 고치세요.\n"
                        "  ⚠️ 길이가 같은 정상 수정(가능하다→불가하다)도 여기 걸립니다."
                        " 오탐이면 기준본을 고치거나 HANGUL_GUARD=off 로 끄세요.\n")
@@ -524,7 +591,9 @@ def main():
     ).hexdigest()[:32]
     marker = os.path.join(CACHE, digest)
     if os.path.exists(marker):
-        sys.exit(0)
+        # 치환이 있었으면 승인 히트에서도 updatedInput 을 내야 한다 —
+        # 여기서 그냥 exit 0 하면 호스트가 원본(=마커 문자열)을 그대로 전송한다
+        emit_updated(tool_input) if did_expand else sys.exit(0)
 
     body = "\n".join(f"  {v}" for _p, v in new_content)
     note = ""
@@ -549,7 +618,10 @@ def main():
 
     deny("기준본에 없는 새 한글입니다. 긴 한글은 재생산 과정에서 자모 하나가 "
          "표류해도(뜬→뜼) 어떤 검사에도 안 걸리므로 저장 전에 한 번 봐야 합니다.\n"
-         "이상 없으면 같은 값을 그대로 다시 보내면 통과합니다.\n\n" + body + note + "\n" + hint)
+         "이상 없으면 같은 값을 그대로 다시 보내면 통과합니다 — 다만 그 재전송도 재생산이라\n"
+         "표류가 한 번 더 들어올 수 있고, 대조할 기준본이 없어 기계적으로는 검출되지 않습니다.\n"
+         "확실하게 보내려면 이 본문을 staging 폴더의 파일로 쓰고 마커로 보내세요"
+         " — 재생산이 0회가 됩니다.\n\n" + body + note + "\n" + hint)
 
 
 main()

@@ -208,6 +208,75 @@ def run():
         check("범위 밖은 차단", None, sent("@@hangul:current/L.md#L9@@"))
         check("역순 범위는 차단", None, sent("@@hangul:current/L.md#L3-L1@@"))
 
+        # --- 마커가 조용히 새어 나가는 경로 (전부 실측 재현으로 확인한 결함) ---
+        def run_raw(tool, tool_input, session="S", fresh=True):
+            """(종료코드, stdout) — 치환 결과까지 봐야 하는 검사용."""
+            if fresh:
+                shutil.rmtree(env.cache, ignore_errors=True)
+            e = dict(os.environ); e["HOME"] = env.cache
+            e.pop("HANGUL_STAGING", None); e.pop("HANGUL_GUARD", None)
+            proc = subprocess.run(
+                [sys.executable, HOOK],
+                input=json.dumps({"session_id": session, "cwd": env.proj,
+                                  "tool_name": tool, "tool_input": tool_input}),
+                capture_output=True, text=True, env=e)
+            return proc.returncode, proc.stdout
+
+        # T1 — 신규 문서는 doc_id 가 없어 늘 에코를 한 번 거친다. 그 승인 히트에서
+        # updatedInput 을 내지 않으면 호스트가 원본(=마커 문자열)을 그대로 저장한다.
+        body = "\n".join(rows)
+        env.stage(**{"target__새문서.md": body + "\n"})
+        new_doc = {"projectKey": "CORE", "summary": "t",
+                   "description": "@@hangul:target/새문서.md@@"}
+        first, _ = run_raw("mcp__x__createJiraIssue", new_doc, session="N")
+        second, out = run_raw("mcp__x__createJiraIssue", new_doc, session="N", fresh=False)
+        check("신규 문서 마커 1회차는 에코", BLOCK, first)
+        check("신규 문서 마커 재전송이 치환을 낸다", body,
+              (json.loads(out)["hookSpecificOutput"]["updatedInput"]["description"]
+               if second == PASS and out else None))
+
+        # T2 — 형태가 어긋난 마커는 치환되지 않는다. 한글이 0자라 수집도 안 돼
+        # 그대로 통과하면 본문 대신 마커 문자열이 저장된다.
+        env.stage(**{"current__L.md": body + "\n"})
+        for label, bad in [("끝 L 누락", "@@hangul:current/L.md#L1-2@@"),
+                           ("L 접두 누락", "@@hangul:current/L.md#1@@"),
+                           ("앞에 다른 글자", "## 제목\n@@hangul:current/L.md@@")]:
+            check(f"어긋난 마커 차단 — {label}", BLOCK,
+                  run_raw(JIRA, {"issueIdOrKey": "L", "fields": {"summary": bad}})[0])
+        check("정상 마커는 통과", PASS,
+              run_raw(JIRA, {"issueIdOrKey": "L",
+                             "fields": {"summary": "@@hangul:current/L.md#L1@@"}})[0])
+        check("검사 대상 밖 도구의 마커 차단", BLOCK,
+              env.call("mcp__browseros__act", {"text": "@@hangul:current/L.md@@"})[0])
+
+        # T3 — 통짜 교체 필드에 줄 범위를 쓰면 지정한 줄만 남고 나머지가 삭제된다
+        check("통짜 필드 + 줄 범위 마커 차단", BLOCK,
+              run_raw(JIRA, {"issueIdOrKey": "L",
+                             "fields": {"description": "@@hangul:current/L.md#L1-L2@@"}})[0])
+        check("통짜 필드 + 파일 전체 마커는 통과", PASS,
+              run_raw(JIRA, {"issueIdOrKey": "L",
+                             "fields": {"description": "@@hangul:current/L.md@@"}})[0])
+
+        # C6 — 실패 사유가 갈려야 진단이 엉뚱한 곳을 짚지 않는다
+        rc, msg = env.call(JIRA, {"issueIdOrKey": "L",
+                                  "fields": {"summary": "@@hangul:current/L.md#L99@@"}})
+        check("범위 밖은 경로 문제로 진단하지 않는다", True,
+              rc == BLOCK and "줄 범위가 파일을 벗어납니다" in msg)
+        rc, msg = env.call(JIRA, {"issueIdOrKey": "L",
+                                  "fields": {"summary": "@@hangul:없는파일.md@@"}})
+        check("없는 파일은 경로로 진단한다", True,
+              rc == BLOCK and "찾을 수 없습니다" in msg)
+
+        # C7 — 차단 메시지가 재생산 말고 마커를 권해야 한다
+        env.stage(**{"current__p.md": BASE + "\n"})
+        _rc, msg = env.call(NOTION, upd(content_updates=[{"old_str": "x", "new_str": DRIFT}]))
+        check("표류 메시지가 마커를 권한다", True, "@@hangul:" in msg)
+        _rc, msg = env.call(NOTION, upd(content_updates=[{"old_str": DRIFT, "new_str": "짧게"}]))
+        check("old_str 메시지가 마커를 권한다", True, "@@hangul:current/p.md#L" in msg)
+        _rc, msg = env.call(NOTION, upd(content_updates=[
+            {"old_str": "x", "new_str": "완전히 새로운 문장이라 기준본에 없는 내용이다"}]))
+        check("에코 메시지가 마커를 권한다", True, "@@hangul:" not in msg or "마커" in msg)
+
         # --- old_str 은 서버 본문 그대로여야 한다 ---
         # 실사용 사례: 「금액 축이다」→「금액 용로 이다」. 길이가 달라 표류 서명에서
         # 빠졌고 노션 400 이 대신 잡았다. old_str 은 '새 내용' 이라는 여지가 없으므로

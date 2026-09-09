@@ -1,7 +1,7 @@
 {
   "name": "hangul-corruption-guard",
   "description": "한글 깨짐(Hangul corruption) — LLM 이 tool call 파라미터에 한글을 잘못 써서 「추천」이 「추첸」이 되는 문제를 저장 직전에 막는다. 인코딩·폰트·터미널 깨짐(mojibake·EUC-KR)과 다른 문제. Claude Code · Cursor · Codex 의 MCP 쓰기(Notion · Jira · Confluence) 대상",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "YourBestDeveloper",
     "email": "wdh@yourbest.dev"

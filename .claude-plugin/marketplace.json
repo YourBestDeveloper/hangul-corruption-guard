@@ -1,0 +1,15 @@
+{
+  "name": "yourbestdeveloper",
+  "owner": {
+    "name": "YourBestDeveloper",
+    "email": "wdh@yourbest.dev"
+  },
+  "plugins": [
+    {
+      "name": "hangul-corruption-guard",
+      "source": "./",
+      "description": "한글 깨짐(Hangul corruption) 방지 — Claude Code · Cursor · Codex CLI 에서 LLM 이 MCP tool call 파라미터(Notion · Jira · Confluence)에 한글을 잘못 써서 멀쩡한 단어가 다른 글자로 바뀌는 것을 기준본 대조로 막는다. 유니코드 이스케이프(\\uXXXX)가 주원인이며 인코딩·폰트·IME 깨짐과는 다른 문제다",
+      "version": "0.1.0"
+    }
+  ]
+}

@@ -401,6 +401,200 @@ def run():
             "trajectory_id": "t", "agent_action_name": "pre_mcp_tool_use",
             "tool_info": {"mcp_server_name": "browseros", "mcp_tool_name": "act",
                           "mcp_tool_arguments": {"text": DRIFT}}})[0])
+
+        # --- staging 탐색은 cwd 에서 위로 (실측 함정: cd 한 번에 마커가 전량 거부됐다) ---
+        def at(cwd, tool_input, tool=JIRA, staging=None, home=None):
+            """cwd·HOME 을 바꿔 가며 부른다 — Env.call 은 프로젝트 루트로 고정돼 있다."""
+            shutil.rmtree(env.cache, ignore_errors=True)
+            e = dict(os.environ); e["HOME"] = home or env.cache
+            e.pop("HANGUL_STAGING", None); e.pop("HANGUL_GUARD", None)
+            if staging:
+                e["HANGUL_STAGING"] = staging
+            proc = subprocess.run(
+                [sys.executable, HOOK],
+                input=json.dumps({"session_id": "W", "cwd": cwd,
+                                  "tool_name": tool, "tool_input": tool_input}),
+                capture_output=True, text=True, env=e)
+            return proc.returncode, proc.stderr.strip()
+
+        env.stage(**{"current__K.md": BASE + "\n"})
+        mark = {"issueIdOrKey": "K", "fields": {"description": "@@hangul:current/K.md@@"}}
+        sub = os.path.join(env.proj, "src", "app")
+        os.makedirs(sub, exist_ok=True)
+
+        # 저장소 밖에서 위로 올라가면 /tmp 같은 world-writable 상위가 후보가 된다 — 안 올라간다
+        check("저장소 밖에서는 상향 탐색 안 함", BLOCK, at(sub, mark)[0])
+
+        os.makedirs(os.path.join(env.proj, ".git"), exist_ok=True)   # 저장소 루트 표시
+        check("하위 폴더에서도 마커가 산다", PASS, at(sub, mark)[0])
+        check("staging 폴더 안에서도 마커가 산다", PASS, at(env.staging, mark)[0])
+        code, msg = at(sub, {"issueIdOrKey": "K", "fields": {"description": DRIFT}})
+        check("하위 폴더에서도 표류를 잡는다", BLOCK, code)
+        # 종료코드만 보면 항진명제다 — 기준본을 못 찾아도 에코로 똑같이 2 가 난다
+        check("  에코가 아니라 표류로 잡는다", True, "표류" in msg and "U+" in msg)
+
+        # 서브모듈처럼 자기 .git 을 가진 하위 저장소 안에서도 바깥 기준본이 보여야 한다
+        vendor = os.path.join(env.proj, "vendor", "lib")
+        os.makedirs(vendor, exist_ok=True)
+        with open(os.path.join(vendor, ".git"), "w", encoding="utf-8") as fh:
+            fh.write("gitdir: ../../.git/modules/lib\n")
+        check("중첩 저장소 안에서도 바깥 기준본이 보인다", PASS, at(vendor, mark)[0])
+
+        # 저장소 루트 위는 보지 않는다 — 남의 기준본이 통행증이 되면 안 된다
+        outer = os.path.abspath(os.path.join(
+            env.proj, "..", "hcg-outer-" + os.path.basename(env.proj)))
+        os.makedirs(os.path.join(outer, "inner", ".git"), exist_ok=True)
+        os.makedirs(os.path.join(outer, ".claude", "hangul-staging", "current"), exist_ok=True)
+        with open(os.path.join(outer, ".claude", "hangul-staging", "current", "K.md"),
+                  "w", encoding="utf-8") as fh:
+            fh.write(BASE + "\n")
+        try:
+            code, msg = at(os.path.join(outer, "inner"), mark)
+            check("저장소 루트 위의 기준본은 안 쓴다", BLOCK, code)
+            check("  찾은 위치를 전부 보여준다", True, "찾은 위치" in msg and "inner" in msg)
+        finally:
+            shutil.rmtree(outer, ignore_errors=True)
+
+        # 남이 쓸 수 있는 폴더는 기준본으로 인정하지 않는다 (조용히 빼지 말고 알려준다)
+        ww = os.path.join(env.proj, "ww")
+        wws = os.path.join(ww, ".claude", "hangul-staging", "current")
+        os.makedirs(wws, exist_ok=True)
+        with open(os.path.join(wws, "K.md"), "w", encoding="utf-8") as fh:
+            fh.write(BASE + "\n")
+        os.chmod(os.path.join(ww, ".claude", "hangul-staging"), 0o777)
+        env.stage(**{"current__Z.md": BASE + "\n"})      # 프로젝트 쪽에는 K.md 가 없다
+        code, msg = at(ww, mark)
+        check("남이 쓸 수 있는 폴더는 기준본으로 안 쓴다", BLOCK, code)
+        check("  건너뛴 사실을 알려준다", True, "건너뜀" in msg)
+
+        # --- staging 이 소비 프로젝트의 git 에 새지 않는다 ---
+        env.stage(**{"current__K.md": BASE + "\n"})
+        ignore = os.path.join(env.staging, ".gitignore")
+        at(env.proj, mark)
+        check("훅이 .gitignore 를 놓는다", True, os.path.isfile(ignore))
+        check("  자기 자신까지 무시한다", True,
+              "*" in open(ignore, encoding="utf-8").read().split("\n"))
+
+        with open(ignore, "w", encoding="utf-8") as fh:
+            fh.write("# 사람이 고친 것\n")
+        at(env.proj, mark)
+        check("이미 있으면 덮어쓰지 않는다", "# 사람이 고친 것\n",
+              open(ignore, encoding="utf-8").read())
+
+        # 심볼릭 링크를 따라가면 링크 대상 파일을 대신 만들어 주는 꼴이 된다
+        victim = os.path.join(env.proj, "victim.txt")
+        os.remove(ignore); os.symlink(victim, ignore)
+        at(env.proj, mark)
+        check("심볼릭 링크는 따라가지 않는다", False, os.path.exists(victim))
+        os.remove(ignore)
+
+        # git 워크트리 밖에서는 .gitignore 가 할 일이 없다 — 순수 부작용이므로 쓰지 않는다
+        outside = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(outside, ".claude", "hangul-staging"), exist_ok=True)
+            at(outside, {"issueIdOrKey": "K", "fields": {"description": BASE}})
+            check("워크트리 밖에는 안 쓴다", False, os.path.exists(
+                os.path.join(outside, ".claude", "hangul-staging", ".gitignore")))
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
+        # 사용자가 직접 지정한 폴더의 git 정책까지 대신 정하지 않는다
+        at(env.proj, mark, staging=env.staging)
+        check("HANGUL_STAGING 폴더에는 안 쓴다", False, os.path.exists(ignore))
+
+        # 워크트리 **안**인데 폴더가 없는 경우라야 「만들지 않는다」가 검사된다
+        empty = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(empty, ".git"), exist_ok=True)
+            at(empty, {"issueIdOrKey": "K", "fields": {"description": BASE}})
+            check("없는 staging 폴더를 만들지 않는다", False,
+                  os.path.exists(os.path.join(empty, ".claude")))
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+
+        # --- 후보 자격은 홈 폴백에도 똑같이 적용된다 ---
+        def plant(root, mode=None, link_to=None):
+            """<root>/.claude/hangul-staging/current/K.md 를 심는다. 만든 staging 경로를 준다."""
+            st = os.path.join(root, ".claude", "hangul-staging")
+            if link_to:
+                os.makedirs(os.path.join(link_to, "current"), exist_ok=True)
+                with open(os.path.join(link_to, "current", "K.md"), "w", encoding="utf-8") as fh:
+                    fh.write(BASE + "\n")
+                os.makedirs(os.path.dirname(st), exist_ok=True)
+                os.symlink(link_to, st)
+                return st
+            os.makedirs(os.path.join(st, "current"), exist_ok=True)
+            with open(os.path.join(st, "current", "K.md"), "w", encoding="utf-8") as fh:
+                fh.write(BASE + "\n")
+            if mode is not None:
+                os.chmod(st, mode)
+            return st
+
+        # 홈 폴백만 검사를 건너뛰면, 늘 존재하는 그 전역 폴더가 무검증 통로가 된다
+        alt_home = tempfile.mkdtemp()
+        loose = tempfile.mkdtemp()
+        try:
+            plant(alt_home, mode=0o777)
+            code, msg = at(loose, mark, home=alt_home)
+            check("홈 폴백도 자격 검사를 받는다", BLOCK, code)
+            check("  사유가 권한이라고 나온다", True, "남이 쓸 수 있음" in msg)
+        finally:
+            shutil.rmtree(alt_home, ignore_errors=True)
+            shutil.rmtree(loose, ignore_errors=True)
+
+        # macOS staff 그룹은 로컬 계정 전원이다 — 그룹 쓰기도 world-writable 과 같다
+        grp_home = tempfile.mkdtemp(); grp_cwd = tempfile.mkdtemp()
+        try:
+            plant(grp_home, mode=0o775)
+            check("그룹 쓰기 폴더도 건너뛴다", BLOCK, at(grp_cwd, mark, home=grp_home)[0])
+        finally:
+            shutil.rmtree(grp_home, ignore_errors=True)
+            shutil.rmtree(grp_cwd, ignore_errors=True)
+
+        # staging 폴더 **자체**가 링크면 O_NOFOLLOW 가 못 지킨다 (마지막 요소만 지키므로)
+        lnk_root = tempfile.mkdtemp(); victim_dir = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(lnk_root, ".git"), exist_ok=True)
+            plant(lnk_root, link_to=victim_dir)
+            code, msg = at(lnk_root, mark)
+            check("staging 폴더가 링크면 안 쓴다", BLOCK, code)
+            check("  사유가 링크라고 나온다", True, "심볼릭 링크" in msg)
+            check("  링크 대상에 .gitignore 를 심지 않는다", False,
+                  os.path.exists(os.path.join(victim_dir, ".gitignore")))
+        finally:
+            shutil.rmtree(lnk_root, ignore_errors=True)
+            shutil.rmtree(victim_dir, ignore_errors=True)
+
+        # 기준본 읽기에도 마커와 같은 봉쇄가 걸려야 한다 — 링크로 폴더 밖을 끌어오면 안 된다
+        esc_root = tempfile.mkdtemp(); esc_out = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(esc_root, ".git"), exist_ok=True)
+            cur = os.path.join(esc_root, ".claude", "hangul-staging", "current")
+            os.makedirs(cur, exist_ok=True)
+            outside = os.path.join(esc_out, "evil.md")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write(BASE + "\n")
+            os.symlink(outside, os.path.join(cur, "K.md"))
+            check("기준본 읽기도 폴더 밖 링크를 거부한다", BLOCK, at(esc_root, {
+                "issueIdOrKey": "K", "fields": {"description": BASE}})[0])
+        finally:
+            shutil.rmtree(esc_root, ignore_errors=True)
+            shutil.rmtree(esc_out, ignore_errors=True)
+
+        # 이미 올리기로 하고 추적 중인 폴더에 * 를 심으면 새 기준본이 조용히 커밋에서 빠진다
+        if shutil.which("git"):
+            tracked = tempfile.mkdtemp()
+            try:
+                quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                subprocess.run(["git", "-C", tracked, "init", "-q"], **quiet)
+                st = plant(tracked)
+                subprocess.run(["git", "-C", tracked, "add", "-A"], **quiet)
+                at(tracked, mark)
+                check("추적 중인 staging 에는 안 쓴다", False,
+                      os.path.exists(os.path.join(st, ".gitignore")))
+            finally:
+                shutil.rmtree(tracked, ignore_errors=True)
+
     finally:
         env.cleanup()
 

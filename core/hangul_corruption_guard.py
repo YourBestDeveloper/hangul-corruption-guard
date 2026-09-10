@@ -27,6 +27,8 @@ import unicodedata
 import json
 import os
 import re
+import stat
+import subprocess
 import sys
 
 MIN_ECHO_HANGUL = 8    # 이보다 짧은 새 줄은 에코로 확인받지 않는다 (라벨 수준의 소음)
@@ -88,15 +90,201 @@ def hangul_len(text):
     return len(HANGUL.findall(unicodedata.normalize("NFC", text)))
 
 
-def staging_dirs(cwd):
+MAX_WALK = 128         # 상향 탐색의 안전판 — 실제 경로 깊이로는 닿지 않는 값이어야 한다.
+#                        25 로 두면 깊은 저장소에서 사슬이 잘려 후보가 cwd 하나로 붕괴하고,
+#                        「저장소 밖」과 구분이 안 돼 진단이 엉뚱한 곳을 짚는다
+
+
+def project_dirs(cwd):
+    """cwd 에서 **가장 바깥 저장소 루트까지**. 저장소 밖이면 cwd 한 곳뿐이다.
+
+    양쪽으로 다 틀릴 수 있어서 둘 다 막는다.
+
+    - **너무 일찍 멈추면** 서브모듈·vendor 처럼 자기 `.git` 을 가진 하위 저장소 안에서
+      상위 프로젝트의 기준본이 후보에서 빠진다 — 고치려던 「마커 전량 거부」가 거기서는
+      그대로 남는다. 그래서 처음 만난 `.git` 에서 멈추지 않고 바깥 루트까지 올라간다.
+    - **너무 멀리 가면** 루트가 없는 cwd 에서 `/` 까지 올라가 `/tmp/.claude/hangul-staging`
+      같은 **남이 쓸 수 있는 폴더**가 기준본 후보가 된다. 마커가 남의 파일 내용으로 치환돼
+      그대로 저장되고 대조 기준까지 그 파일이 된다 — 검사가 뒤집힌다. 그래서 저장소를
+      못 찾으면 상향 탐색 자체를 하지 않는다.
+
+    `.claude` 를 루트 표식으로 치지 않는 이유: 기준본 폴더가 있다는 것은 곧 `.claude` 가
+    있다는 뜻이라, 그것을 표식으로 삼으면 「심어 둔 폴더가 스스로 자기 자리를 정당화한다」.
+    """
+    home = os.path.realpath(os.path.expanduser("~"))
+    chain, path = [], os.path.realpath(cwd)
+    while len(chain) < MAX_WALK:
+        chain.append(path)
+        if path == home:
+            break                      # 홈 위로는 올라가지 않는다
+        parent = os.path.dirname(path)
+        if parent == path:
+            break                      # 파일시스템 루트
+        path = parent
+    outermost = -1
+    for index, path in enumerate(chain):
+        if os.path.exists(os.path.join(path, ".git")):
+            outermost = index          # worktree·서브모듈은 .git 이 파일이다
+    return chain[: outermost + 1] if outermost >= 0 else chain[:1]
+
+
+def dir_reason(path):
+    """기준본 폴더로 쓸 수 없는 사유. 쓸 수 있으면 None.
+
+    사유를 나눠 두는 이유: `chmod` 로 고칠 수 있는 것과 아닌 것이 한 문구로 뭉치면 안내가 틀린다.
+
+    - **링크면 거부한다.** `os.stat` 은 링크를 따라가므로 링크 **자체**는 검사되지 않는다.
+      staging 폴더가 링크면 이후 모든 검사가 대상 폴더 기준이 되고, `.gitignore` 도 대상
+      폴더에 심긴다 — `O_NOFOLLOW` 는 **마지막 경로 요소**만 지키기 때문이다.
+    - **그룹 쓰기도 막는다.** macOS 의 기본 그룹 `staff` 에는 로컬 계정 전원이 들어가고,
+      umask 002 인 서버에서는 `mkdir` 이 그냥 0775 를 만든다 — world-writable 과 같다.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return "읽을 수 없음"
+    if stat.S_ISLNK(st.st_mode):
+        return "심볼릭 링크"
+    if st.st_mode & 0o022:
+        return "남이 쓸 수 있음 (chmod go-w)"
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        return "내 소유가 아님"
+    return None
+
+
+def own_dir(path):
+    return dir_reason(path) is None
+
+
+def inside(base, path):
+    """realpath 기준으로 path 가 base 안인가.
+
+    마커 경로만 막고 기준본 읽기를 안 막으면, staging 안에 폴더 밖을 가리키는 심볼릭 링크
+    하나로 남의 파일이 「이미 확인된 줄」이 되어 표류 검사를 통과시킨다. 두 경로가 같은
+    판정을 써야 한다.
+    """
+    root = os.path.realpath(base)
+    real = os.path.realpath(path)
+    return real == root or real.startswith(root + os.sep)
+
+
+def staging_scan(cwd):
+    """(쓸 수 있는 후보, 건너뛴 후보 [(경로, 사유)]) — 둘 다 가까운 곳부터.
+
+    홈 폴백도 **같은 관문**을 지난다. 예외로 두면 늘 존재하는 그 폴더만 검사 없이 통과해,
+    남이 쓸 수 있는 전역 폴더의 내용이 그대로 기준본이 된다.
+    건너뛴 것을 따로 돌려주는 이유: 조용히 빼면 「마커가 왜 거부되는지」를 알 수 없다.
+    """
     override = os.environ.get("HANGUL_STAGING")
     if override:
-        return [os.path.expanduser(override)]
-    dirs = []
-    if cwd:
-        dirs.append(os.path.join(cwd, ".claude", "hangul-staging"))
-    dirs.append(os.path.expanduser("~/.claude/hangul-staging"))
-    return dirs
+        return [os.path.expanduser(override)], []     # 사용자가 직접 지정한 곳은 그대로 믿는다
+    candidates = [os.path.join(base, ".claude", "hangul-staging")
+                  for base in (project_dirs(cwd) if cwd else [])]
+    candidates.append(os.path.expanduser("~/.claude/hangul-staging"))
+    usable, skipped, seen = [], [], set()
+    for path in candidates:
+        key = os.path.realpath(path)      # 문자열 비교로는 링크·표기 차이를 못 걸러 중복된다
+        if key in seen:
+            continue
+        seen.add(key)
+        reason = dir_reason(path) if os.path.isdir(path) else None
+        if reason:
+            skipped.append((path, reason))
+        else:
+            usable.append(path)
+    return usable, skipped
+
+
+def staging_dirs(cwd):
+    return staging_scan(cwd)[0]
+
+
+def primary_staging(cwd):
+    """안내문에 쓸 **한** 경로 — 실제로 쓸 수 있는 곳이어야 한다.
+
+    스캔이 건너뛴 폴더를 안내하면 시키는 대로 파일을 써도 상태가 변하지 않는 막다른 길이 된다.
+    홈 폴백을 「이미 있는 폴더」로 먼저 치지도 않는다 — `~/.claude/hangul-staging` 은 이 훅을
+    한 번 써 본 사용자에게 늘 존재하므로, 정작 안내가 필요한 경우(=프로젝트에 기준본이 아직
+    없다)마다 전역 폴더를 가리키게 된다. 거기 쌓인 기준본은 문서 id 만 같으면 이 머신의
+    **모든** 저장소에서 통행증이 되고, 폴더 안 `.gitignore` 도 무의미해진다.
+    """
+    override = os.environ.get("HANGUL_STAGING")
+    if override:
+        return os.path.expanduser(override)
+    home = os.path.expanduser("~/.claude/hangul-staging")
+    local = [p for p in staging_dirs(cwd) if p != home]
+    for path in local:
+        if os.path.isdir(path):
+            return path
+    for path in reversed(local):          # 없으면 만들 곳 — 가장 바깥 루트부터, 쓸 수 있는 곳으로
+        if os.access(os.path.dirname(os.path.dirname(path)), os.W_OK):
+            return path
+    return home
+
+
+IGNORE_BODY = ("# hangul-corruption-guard 기준본 — 서버 본문 사본이라 저장소에 올리지 않는다\n"
+               "# 이 파일 자신을 포함해 전부 무시한다\n"
+               "*\n")
+
+
+def git_tracked(base):
+    """이 폴더에 이미 추적 중인 파일이 있나. **git 을 못 부르면 True** 로 본다.
+
+    올리기로 하고 커밋해 둔 폴더에 `*` 를 심으면, 기존 파일은 계속 추적되므로 아무 증상이 없고
+    **그 뒤에 추가되는 기준본만** `git add` 에서 조용히 빠진다. 심은 `.gitignore` 자신도 `*` 에
+    걸려 `git status` 가 비어 있어 단서가 남지 않는다. 모르면 건드리지 않는 쪽이 맞다.
+    """
+    # `-C base` + 상대 pathspec 이라 base 가 속한 저장소가 스스로 답한다. base 가 상위
+    # 저장소일 수도 있어서(서브모듈), 고정된 repo 경로로 물으면 pathspec 이 범위를 벗어난다.
+    try:
+        done = subprocess.run(["git", "-C", base, "ls-files", "--",
+                               os.path.join(".claude", "hangul-staging")],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        return True                       # git 이 없거나 느리면 판단 불가 — 건드리지 않는다
+    return bool(done.stdout.strip())      # 저장소가 아니면 빈 출력이라 추적 중인 것도 없다
+
+
+def ensure_staging_ignored(cwd):
+    """기준본 폴더가 소비 프로젝트의 git 에 잡히지 않게, 폴더 안에 자기 자신을 무시하는
+    `.gitignore` 를 놓는다.
+
+    폴더를 만드는 것은 `/stage` 를 따르는 에이전트이고 **프롬프트 지시에는 강제력이 없다** —
+    이 훅의 존재 이유와 같은 이유로, 문서에만 적어 두면 지켜지지 않는다. 실제로 소비
+    프로젝트에 서버 본문 사본 4개가 untracked 로 남아 있었다.
+
+    남의 저장소에 파일을 쓰는 일이라 조건을 좁게 잡는다 — 폴더를 **만들지 않고**(없는 폴더를
+    훅이 만들어내면 아무 프로젝트에나 빈 폴더가 생긴다), git 워크트리 **안**에서만 쓰고
+    (밖에서는 할 일이 없는 순수 부작용이다), 폴더가 링크거나 남이 쓸 수 있으면 건너뛰고,
+    **이미 추적 중인 파일이 있으면 건드리지 않고**, `HANGUL_STAGING` 으로 직접 지정한 폴더도
+    건드리지 않는다(그 폴더의 git 정책까지 대신 정할 일은 아니다).
+    """
+    if os.environ.get("HANGUL_STAGING") or not cwd:
+        return
+    roots = project_dirs(cwd)
+    if not any(os.path.exists(os.path.join(base, ".git")) for base in roots):
+        return
+    for base in roots:
+        path = os.path.join(base, ".claude", "hangul-staging")
+        target = os.path.join(path, ".gitignore")
+        if not os.path.isdir(path) or not own_dir(path) or os.path.lexists(target):
+            continue
+        if git_tracked(base):
+            continue
+        try:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        except OSError:
+            continue                      # 이미 있거나(O_EXCL) 링크이거나(O_NOFOLLOW) 못 쓴다
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(IGNORE_BODY)
+        except Exception:
+            # 내용 없는 .gitignore 가 남으면 다음 호출은 「이미 있다」로 넘어가 영영 복구되지 않는다
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
 
 
 def doc_id(tool_input):
@@ -137,7 +325,7 @@ def doc_lines(cwd, ident, role):
     for base in staging_dirs(cwd):
       for name in names:
         path = os.path.join(base, name)
-        if os.path.isfile(path):
+        if os.path.isfile(path) and inside(base, path):
             try:
                 text = open(path, encoding="utf-8").read()
             except Exception:
@@ -145,24 +333,6 @@ def doc_lines(cwd, ident, role):
             return [(normalize(l), l.strip()) for l in text.splitlines()
                     if hangul_len(l)]
     return []
-
-
-def staged_lines(cwd):
-    """기준본의 한글 줄 목록 — 정규화본과 원본을 함께 들고 있는다."""
-    out = []
-    for base in staging_dirs(cwd):
-        if not os.path.isdir(base):
-            continue
-        for root, _dirs, files in os.walk(base):
-            for name in files:
-                try:
-                    text = open(os.path.join(root, name), encoding="utf-8").read()
-                except Exception:
-                    continue
-                for line in text.splitlines():
-                    if hangul_len(line):
-                        out.append((normalize(line), line.strip()))
-    return out
 
 
 def collect(tool_input):
@@ -191,9 +361,8 @@ def resolve_marker(cwd, rel, first=None, last=None):
     """staging 안의 파일만 허용한다. 경로 탈출은 거부.
     줄 번호가 주어지면 그 구간만 돌려준다(1부터, 끝 줄 포함)."""
     for base in staging_dirs(cwd):
-        root = os.path.realpath(base)
-        path = os.path.realpath(os.path.join(root, rel))
-        if not ((path == root or path.startswith(root + os.sep)) and os.path.isfile(path)):
+        path = os.path.realpath(os.path.join(os.path.realpath(base), rel))
+        if not (inside(base, path) and os.path.isfile(path)):
             continue
         try:
             text = open(path, encoding="utf-8").read()
@@ -417,6 +586,8 @@ def main():
                    " 본문을 직접 보내세요.\n")
         sys.exit(0)
 
+    ensure_staging_ignored(cwd)
+
     # 마커 치환을 먼저 한다 — 이후 모든 검사는 치환된 본문에 대해 돌아야
     # 치환이 검사를 우회하는 구멍이 되지 않는다
     misses, used_files, ranged = [], [], []
@@ -430,10 +601,19 @@ def main():
             deny(f"기준본 파일을 읽지 못했습니다: {found}\n"
                  "  UTF-8 로 저장돼 있는지 확인하세요.\n")
     if misses:
+        usable, skipped = staging_scan(cwd)
         deny("기준본 파일을 찾을 수 없습니다: "
              + ", ".join(f"@@hangul:{m}@@" for m, _r, _f in misses)
-             + f"\n  찾은 위치: {staging_dirs(cwd)[0]}\n"
-               "  경로는 staging 폴더 기준 상대경로여야 하고, 폴더 밖은 거부합니다.\n")
+             + "\n  찾은 위치 (가까운 곳부터):\n"
+             + "".join(f"    {p}\n" for p in usable)
+             + "".join(f"    {p}  ← 건너뜀: {why}\n" for p, why in skipped)
+             + "  경로는 staging 폴더 기준 상대경로여야 하고, 폴더 밖은 거부합니다.\n"
+               "  위 경로가 예상과 다르면 셸의 현재 작업 디렉토리가 엉뚱한 곳입니다"
+               " — 프로젝트 루트에서 다시 부르세요.\n"
+               "  ⚠️ staging 폴더는 폴더 안 .gitignore 때문에 ripgrep 계열 검색"
+               "(에이전트의 Grep·Glob 포함)에 잡히지 않습니다.\n"
+               "     「없다」로 보이는 것은 무시된 것일 수 있으니, 경로를 직접 주고"
+               " 셸 `grep -n` 이나 `ls` 로 확인하세요.\n")
 
     # 형태가 어긋나 치환되지 않은 마커. 그대로 나가면 본문 대신 마커가 저장된다
     stray = leftover_markers(expanded)
@@ -602,7 +782,7 @@ def main():
         # 긴 새 본문이 영구 차단돼 「막다른 길을 만들지 않는다」는 원칙이 깨진다.
         head, tail = body[: ECHO_CAP // 2], body[-ECHO_CAP // 2 :]
         note = (f"\n\n⚠️ {len(body)}자라 가운데를 생략했습니다. 전체를 확인하려면"
-                f" {staging_dirs(cwd)[0]} 에 기준본을 써 두세요 — 그러면 문자 단위로 대조합니다.\n")
+                f" {primary_staging(cwd)} 에 기준본을 써 두세요 — 그러면 문자 단위로 대조합니다.\n")
         body = head + "\n\n  … (가운데 생략) …\n\n" + tail
 
     os.makedirs(CACHE, exist_ok=True)
@@ -613,7 +793,7 @@ def main():
     hint = ""
     if ident and not current:
         hint = (f"\n기존 문서를 고치는 중이고 위 줄이 **원래 본문을 그대로 옮긴 것**이라면,\n"
-                f"서버 본문을 받아 {os.path.join(staging_dirs(cwd)[0], 'current', ident + '.md')} 에\n"
+                f"서버 본문을 받아 {os.path.join(primary_staging(cwd), 'current', ident + '.md')} 에\n"
                 f"저장해 두세요. 그러면 이 확인이 사라지고 문자 단위로 대조됩니다.\n")
 
     deny("기준본에 없는 새 한글입니다. 긴 한글은 재생산 과정에서 자모 하나가 "

@@ -403,19 +403,31 @@ def run():
                           "mcp_tool_arguments": {"text": DRIFT}}})[0])
 
         # --- staging 탐색은 cwd 에서 위로 (실측 함정: cd 한 번에 마커가 전량 거부됐다) ---
-        def at(cwd, tool_input, tool=JIRA, staging=None, home=None):
-            """cwd·HOME 을 바꿔 가며 부른다 — Env.call 은 프로젝트 루트로 고정돼 있다."""
-            shutil.rmtree(env.cache, ignore_errors=True)
+        def at_raw(cwd, tool_input, tool=JIRA, staging=None, home=None,
+                   fresh=True, session="W"):
+            """cwd·HOME·세션을 바꿔 가며 부른다 — Env.call 은 프로젝트 루트로 고정돼 있다."""
+            if fresh:
+                shutil.rmtree(env.cache, ignore_errors=True)
             e = dict(os.environ); e["HOME"] = home or env.cache
             e.pop("HANGUL_STAGING", None); e.pop("HANGUL_GUARD", None)
             if staging:
                 e["HANGUL_STAGING"] = staging
-            proc = subprocess.run(
+            return subprocess.run(
                 [sys.executable, HOOK],
-                input=json.dumps({"session_id": "W", "cwd": cwd,
+                input=json.dumps({"session_id": session, "cwd": cwd,
                                   "tool_name": tool, "tool_input": tool_input}),
                 capture_output=True, text=True, env=e)
+
+        def at(*a, **kw):
+            proc = at_raw(*a, **kw)
             return proc.returncode, proc.stderr.strip()
+
+        def mkgit(path):
+            """**진짜** 저장소를 만든다 — git_tracked 가 fail-closed 라 가짜 .git 으로는
+            쓰기 경로가 열리지 않는다(rc≠0 이면 「모른다」로 보고 건드리지 않는다)."""
+            os.makedirs(path, exist_ok=True)
+            subprocess.run(["git", "-C", path, "init", "-q"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         env.stage(**{"current__K.md": BASE + "\n"})
         mark = {"issueIdOrKey": "K", "fields": {"description": "@@hangul:current/K.md@@"}}
@@ -425,7 +437,7 @@ def run():
         # 저장소 밖에서 위로 올라가면 /tmp 같은 world-writable 상위가 후보가 된다 — 안 올라간다
         check("저장소 밖에서는 상향 탐색 안 함", BLOCK, at(sub, mark)[0])
 
-        os.makedirs(os.path.join(env.proj, ".git"), exist_ok=True)   # 저장소 루트 표시
+        mkgit(env.proj)                                              # 저장소 루트 표시
         check("하위 폴더에서도 마커가 산다", PASS, at(sub, mark)[0])
         check("staging 폴더 안에서도 마커가 산다", PASS, at(env.staging, mark)[0])
         code, msg = at(sub, {"issueIdOrKey": "K", "fields": {"description": DRIFT}})
@@ -472,21 +484,25 @@ def run():
         ignore = os.path.join(env.staging, ".gitignore")
         at(env.proj, mark)
         check("훅이 .gitignore 를 놓는다", True, os.path.isfile(ignore))
-        check("  자기 자신까지 무시한다", True,
+        # 파일이 없을 때 여기서 크래시하면 뒤 검사가 통째로 안 돈다 — 실패는 FAIL 로 남겨야 한다
+        check("  자기 자신까지 무시한다", True, os.path.isfile(ignore) and
               "*" in open(ignore, encoding="utf-8").read().split("\n"))
 
         with open(ignore, "w", encoding="utf-8") as fh:
             fh.write("# 사람이 고친 것\n")
         at(env.proj, mark)
         check("이미 있으면 덮어쓰지 않는다", "# 사람이 고친 것\n",
-              open(ignore, encoding="utf-8").read())
+              open(ignore, encoding="utf-8").read() if os.path.isfile(ignore) else None)
 
         # 심볼릭 링크를 따라가면 링크 대상 파일을 대신 만들어 주는 꼴이 된다
         victim = os.path.join(env.proj, "victim.txt")
-        os.remove(ignore); os.symlink(victim, ignore)
+        if os.path.lexists(ignore):
+            os.remove(ignore)
+        os.symlink(victim, ignore)
         at(env.proj, mark)
         check("심볼릭 링크는 따라가지 않는다", False, os.path.exists(victim))
-        os.remove(ignore)
+        if os.path.lexists(ignore):
+            os.remove(ignore)
 
         # git 워크트리 밖에서는 .gitignore 가 할 일이 없다 — 순수 부작용이므로 쓰지 않는다
         outside = tempfile.mkdtemp()
@@ -554,7 +570,7 @@ def run():
         # staging 폴더 **자체**가 링크면 O_NOFOLLOW 가 못 지킨다 (마지막 요소만 지키므로)
         lnk_root = tempfile.mkdtemp(); victim_dir = tempfile.mkdtemp()
         try:
-            os.makedirs(os.path.join(lnk_root, ".git"), exist_ok=True)
+            mkgit(lnk_root)
             plant(lnk_root, link_to=victim_dir)
             code, msg = at(lnk_root, mark)
             check("staging 폴더가 링크면 안 쓴다", BLOCK, code)
@@ -581,19 +597,88 @@ def run():
             shutil.rmtree(esc_root, ignore_errors=True)
             shutil.rmtree(esc_out, ignore_errors=True)
 
-        # 이미 올리기로 하고 추적 중인 폴더에 * 를 심으면 새 기준본이 조용히 커밋에서 빠진다
-        if shutil.which("git"):
+        # 이미 올리기로 하고 추적 중인 폴더에 * 를 심으면 새 기준본이 조용히 커밋에서 빠진다.
+        # 인덱스에만 있어도(=add -A) 다음 커밋에 그대로 들어가므로 같이 막는다 — 「커밋된 것만
+        # 본다(ls-tree HEAD)」로 좁히면 이 계약이 깨진다.
+        quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        for label, commit in (("인덱스에만 있어도", False), ("커밋된 폴더에는", True)):
             tracked = tempfile.mkdtemp()
             try:
-                quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-                subprocess.run(["git", "-C", tracked, "init", "-q"], **quiet)
+                mkgit(tracked)
                 st = plant(tracked)
                 subprocess.run(["git", "-C", tracked, "add", "-A"], **quiet)
+                if commit:
+                    subprocess.run(["git", "-C", tracked, "-c", "user.email=t@t",
+                                    "-c", "user.name=t", "commit", "-qm", "x"], **quiet)
                 at(tracked, mark)
-                check("추적 중인 staging 에는 안 쓴다", False,
-                      os.path.exists(os.path.join(st, ".gitignore")))
+                check(f"{label} 안 쓴다", False, os.path.exists(os.path.join(st, ".gitignore")))
             finally:
                 shutil.rmtree(tracked, ignore_errors=True)
+
+        # 커밋이 하나도 없는 저장소(unborn HEAD)는 추적 중인 것이 없으므로 써야 한다.
+        # ls-tree HEAD 로 바꾸면 rc=128 이 되어 여기서 걸린다.
+        unborn = tempfile.mkdtemp()
+        try:
+            mkgit(unborn); st = plant(unborn)
+            at(unborn, mark)
+            check("커밋 없는 저장소에는 쓴다", True, os.path.exists(os.path.join(st, ".gitignore")))
+        finally:
+            shutil.rmtree(unborn, ignore_errors=True)
+
+        # git 이 대답을 못 하면 「모른다」다 — 빈 출력을 「추적 없음」으로 읽으면 커밋된
+        # 기준본이 있는 저장소에도 심게 된다(실측으로 재현했던 fail-open)
+        broken = tempfile.mkdtemp()
+        try:
+            mkgit(broken); st = plant(broken)
+            with open(os.path.join(broken, ".git", "index"), "w") as fh:
+                fh.write("garbage")
+            at(broken, mark)
+            check("git 이 실패하면 안 쓴다", False, os.path.exists(os.path.join(st, ".gitignore")))
+        finally:
+            shutil.rmtree(broken, ignore_errors=True)
+
+        # 홈이 git 저장소인 사람(dotfiles)의 전역 폴백 폴더까지 훅이 정할 일은 아니다
+        gh = tempfile.mkdtemp()
+        try:
+            mkgit(gh); st = plant(gh)
+            at(gh, mark, home=gh)
+            check("홈 저장소에는 안 쓴다", False, os.path.exists(os.path.join(st, ".gitignore")))
+        finally:
+            shutil.rmtree(gh, ignore_errors=True)
+
+        # 안 쓰기로 했으면 조용히 넘어가지 말고 세션에 한 번 알린다
+        told = tempfile.mkdtemp()
+        try:
+            mkgit(told); plant(told)
+            subprocess.run(["git", "-C", told, "add", "-A"], **quiet)
+            plain = {"issueIdOrKey": "K", "fields": {"description": "plain ascii body"}}
+            first = at_raw(told, plain, session="N1")
+            check("추적 중이면 알린다", True, "추적 중" in first.stdout)
+            check("  차단하지는 않는다", PASS, first.returncode)
+            # ⚠️ 치환할 것이 없는데 permissionDecision 을 실으면 그 호출의 권한 프롬프트가
+            #    자동 승인된다 — 알리려다 사용자의 확인 절차를 없애는 꼴이 된다
+            check("  알림만 낼 때 permissionDecision 을 싣지 않는다", False,
+                  "permissionDecision" in first.stdout)
+            again = at_raw(told, plain, session="N1", fresh=False)
+            check("  같은 세션에서 두 번 알리지 않는다", False, "추적 중" in again.stdout)
+            # 반대로 치환이 있는 호출에서는 allow 가 반드시 함께 나가야 한다(치환의 전제)
+            withmark = at_raw(told, mark, session="N2", fresh=False)
+            check("  치환 호출에는 allow 가 나간다", True,
+                  '"permissionDecision": "allow"' in withmark.stdout)
+            # 판정을 캐시하므로 세션이 달라도 git 을 다시 묻지 않는다(그래서 알림도 안 뜬다)
+            check("  판정은 캐시된다", False, "추적 중" in withmark.stdout)
+        finally:
+            shutil.rmtree(told, ignore_errors=True)
+
+        # 게이트 밖 MCP 호출에서도 정리는 돈다 — 게이트 쓰기가 0회인 세션이 실측 36 중 21이었다
+        outside_gate = tempfile.mkdtemp()
+        try:
+            mkgit(outside_gate); st = plant(outside_gate)
+            at(outside_gate, {"query": "x"}, tool="mcp__plugin_Notion_notion__notion-fetch")
+            check("게이트 밖 호출에서도 .gitignore 를 놓는다", True,
+                  os.path.exists(os.path.join(st, ".gitignore")))
+        finally:
+            shutil.rmtree(outside_gate, ignore_errors=True)
 
     finally:
         env.cleanup()

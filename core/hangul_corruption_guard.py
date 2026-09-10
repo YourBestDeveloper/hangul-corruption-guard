@@ -228,11 +228,17 @@ IGNORE_BODY = ("# hangul-corruption-guard 기준본 — 서버 본문 사본이�
 
 
 def git_tracked(base):
-    """이 폴더에 이미 추적 중인 파일이 있나. **git 을 못 부르면 True** 로 본다.
+    """이 폴더에 이미 추적 중인 파일이 있나. **판단하지 못하면 True** 로 본다.
 
-    올리기로 하고 커밋해 둔 폴더에 `*` 를 심으면, 기존 파일은 계속 추적되므로 아무 증상이 없고
-    **그 뒤에 추가되는 기준본만** `git add` 에서 조용히 빠진다. 심은 `.gitignore` 자신도 `*` 에
-    걸려 `git status` 가 비어 있어 단서가 남지 않는다. 모르면 건드리지 않는 쪽이 맞다.
+    커밋뿐 아니라 **인덱스까지** 보는 것이 이 판정의 핵심이다. `git add` 된 경로는 다음 커밋에
+    그대로 들어가므로, 거기에 `*` 를 심으면 (a) 스테이지된 기준본은 그대로 커밋되고 (b) 심은
+    `.gitignore` 는 자기 `*` 에 걸려 끝내 커밋되지 않는다. 그 뒤로는 팀 전원의 새 기준본이
+    `git status` 에도 `git add -A` 에도 안 잡히고 `--ignored` 로만 보인다.
+
+    「커밋된 것만 보자」(`git ls-tree HEAD`)는 이 방어를 커밋 직전 구간에서만 골라 끄는 것이라
+    채택하지 않았다. `git checkout --orphan` 처럼 인덱스는 추적 파일로 가득한데 HEAD 가 unborn
+    인 평범한 상태에서도 같은 사고가 난다. 보이는 실패(status 오염)를 안 보이는 실패(조용한
+    누락)와 맞바꾸는 방향이라 이 프로젝트의 다른 결정과도 어긋난다.
     """
     # `-C base` + 상대 pathspec 이라 base 가 속한 저장소가 스스로 답한다. base 가 상위
     # 저장소일 수도 있어서(서브모듈), 고정된 repo 경로로 물으면 pathspec 이 범위를 벗어난다.
@@ -242,10 +248,14 @@ def git_tracked(base):
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
     except Exception:
         return True                       # git 이 없거나 느리면 판단 불가 — 건드리지 않는다
-    return bool(done.stdout.strip())      # 저장소가 아니면 빈 출력이라 추적 중인 것도 없다
+    if done.returncode != 0:
+        # 저장소가 아니거나 인덱스가 깨졌거나 소유권 거부다. 빈 출력을 「추적 없음」으로 읽으면
+        # 커밋된 기준본이 있는 저장소에도 심게 된다 — 실측으로 재현한 fail-open 이었다.
+        return True
+    return bool(done.stdout.strip())
 
 
-def ensure_staging_ignored(cwd):
+def ensure_staging_ignored(cwd, session=""):
     """기준본 폴더가 소비 프로젝트의 git 에 잡히지 않게, 폴더 안에 자기 자신을 무시하는
     `.gitignore` 를 놓는다.
 
@@ -257,19 +267,41 @@ def ensure_staging_ignored(cwd):
     훅이 만들어내면 아무 프로젝트에나 빈 폴더가 생긴다), git 워크트리 **안**에서만 쓰고
     (밖에서는 할 일이 없는 순수 부작용이다), 폴더가 링크거나 남이 쓸 수 있으면 건너뛰고,
     **이미 추적 중인 파일이 있으면 건드리지 않고**, `HANGUL_STAGING` 으로 직접 지정한 폴더도
-    건드리지 않는다(그 폴더의 git 정책까지 대신 정할 일은 아니다).
+    건드리지 않는다(그 폴더의 git 정책까지 대신 정할 일은 아니다). 홈도 건너뛴다 — 홈이 git
+    저장소인 사람(dotfiles)의 전역 폴백 폴더까지 이 훅이 정할 일은 아니다.
+
+    **안 쓰기로 한 판정은 캐시한다.** 추적 중이면 `.gitignore` 가 끝내 안 생기므로 `lexists`
+    빠른 탈출이 영영 안 걸리고 매 호출 `git ls-files` 를 띄우게 된다(실측 43~52ms). 이 함수는
+    게이트 밖 MCP 호출에서도 도므로 그 낭비가 호출 전체로 번진다. TTL 을 둬서 추적이 풀리면
+    다시 보게 하고, 안 쓴 사실은 **세션에 한 번 알린다** — 조용한 무동작은 원인을 알 길이 없다.
     """
     if os.environ.get("HANGUL_STAGING") or not cwd:
         return
     roots = project_dirs(cwd)
     if not any(os.path.exists(os.path.join(base, ".git")) for base in roots):
         return
+    home = os.path.realpath(os.path.expanduser("~"))
     for base in roots:
+        if os.path.realpath(base) == home:
+            continue
         path = os.path.join(base, ".claude", "hangul-staging")
         target = os.path.join(path, ".gitignore")
         if not os.path.isdir(path) or not own_dir(path) or os.path.lexists(target):
             continue
+        skip = _cache_marker("skip-", os.path.realpath(path))
+        if marker_is_fresh(skip, IGNORE_VERDICT_TTL):
+            continue
         if git_tracked(base):
+            remember(skip)
+            told = _cache_marker("told-", session + "\x00" + os.path.realpath(path))
+            if not os.path.exists(told):
+                remember(told)
+                notice("[hangul-corruption-guard] 기준본 폴더가 이미 git 에 추적 중이라"
+                       " 무시 설정을 넣지 않았습니다:\n"
+                       f"  {path}\n"
+                       "  git status 오염을 없애려면:  git rm -r --cached"
+                       " .claude/hangul-staging\n"
+                       "  팀과 공유할 생각이면 그대로 두세요.")
             continue
         try:
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -437,14 +469,58 @@ def leftover_markers(node):
     return out
 
 
+IGNORE_VERDICT_TTL = 3600   # 초. 추적이 풀리면(git rm --cached) 이 안에 다시 본다
+
+NOTICES = []                # 차단이 아니라 「알리기만」 하는 메시지. 종료 직전에 한 번 실린다
+
+
+def notice(text):
+    NOTICES.append(text)
+
+
+def _cache_marker(prefix, key):
+    return os.path.join(CACHE, prefix + hashlib.sha256(key.encode("utf-8")).hexdigest())
+
+
+def marker_is_fresh(path, ttl):
+    try:
+        return time.time() - os.path.getmtime(path) < ttl
+    except OSError:
+        return False
+
+
+def remember(path):
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        open(path, "w").close()
+    except Exception:
+        pass                              # 캐시를 못 써도 동작은 같다 — 판정을 더 자주 할 뿐이다
+
+
+def passthru(tool_input=None, did_expand=False):
+    """통과 — 밀린 알림이 있으면 그것만 실어 보낸다.
+
+    ⚠️ 알림만 낼 때 `permissionDecision: "allow"` 를 **같이 실으면 안 된다.** 그러면 그 호출의
+    권한 프롬프트까지 자동 승인해 버린다 — 알리려다 사용자의 확인 절차를 없애는 꼴이 된다.
+    """
+    if did_expand:
+        emit_updated(tool_input)          # 치환 결과에 알림을 얹어 나간다 (emit_updated 가 처리)
+    if NOTICES:
+        print(json.dumps({"systemMessage": "\n".join(NOTICES)}, ensure_ascii=False))
+    sys.exit(0)
+
+
 def emit_updated(tool_input):
     """Claude Code 형식. Cursor 는 호환 레이어가 updatedInput -> updated_input 으로
     매핑하고, Codex 는 같은 형식을 쓴다(단 permissionDecision:allow 가 반드시 함께)."""
-    print(json.dumps({"hookSpecificOutput": {
+    payload = {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
         "updatedInput": tool_input,
-    }}, ensure_ascii=False))
+    }}
+    if NOTICES:
+        payload["systemMessage"] = "\n".join(NOTICES)
+    print(json.dumps(payload, ensure_ascii=False))
     sys.exit(0)
 
 
@@ -460,6 +536,8 @@ def diff_marks(reference, sent):
 
 
 def deny(message):
+    if NOTICES:
+        message = "\n".join(NOTICES) + "\n" + message
     sys.stderr.write(message)
     sys.exit(2)
 
@@ -576,6 +654,13 @@ def main():
         sys.exit(0)   # 오탐으로 막혔을 때 빠져나갈 문. 없으면 작업이 멈춘다
 
     tool_name, tool_input, cwd, session = extract_call(data)
+
+    # 게이트 **앞**에서 돈다. 게이트 쓰기가 한 번도 없는 세션에서도 기준본 폴더를 덮기
+    # 위해서다 — 실측으로 MCP 를 쓴 36개 세션 중 21개가 게이트 호출 0회였고 그 세션들에서는
+    # 이 정리가 아예 돌지 않았다. (창을 좁히는 효과는 없다: 실제 트랜스크립트에서 폴더 생성과
+    # 첫 게이트 쓰기 사이의 비게이트 MCP 는 0건이었다.) 빠른 경로는 0.1ms 대다.
+    ensure_staging_ignored(cwd, session or "")
+
     if not any(marker in tool_name for marker in GATED):
         # 화이트리스트 밖에서는 치환이 돌지 않는다. 마커를 보냈다면 그대로 저장되므로 막는다
         stray = leftover_markers(tool_input)
@@ -584,9 +669,7 @@ def main():
                  + "\n".join(f"  {v}" for v in stray)
                  + "\n\n이대로 보내면 본문 대신 마커 문자열이 저장됩니다."
                    " 본문을 직접 보내세요.\n")
-        sys.exit(0)
-
-    ensure_staging_ignored(cwd)
+        passthru()
 
     # 마커 치환을 먼저 한다 — 이후 모든 검사는 치환된 본문에 대해 돌아야
     # 치환이 검사를 우회하는 구멍이 되지 않는다
@@ -665,7 +748,7 @@ def main():
 
     targets = collect(tool_input)
     if not targets:
-        emit_updated(tool_input) if did_expand else sys.exit(0)
+        passthru(tool_input, did_expand)
 
     ident = doc_id(tool_input)
     target = doc_lines(cwd, ident, "target")     # 내 의도 — 삭제·커버리지 판정
@@ -760,7 +843,7 @@ def main():
 
     if not new_content:
         # 전부 기준본과 일치
-        emit_updated(tool_input) if did_expand else sys.exit(0)
+        passthru(tool_input, did_expand)
 
     # (3) 새 내용 — 에코 후 확인. 이 경로는 항상 열려 있어야 한다
     # 승인은 (세션 · 도구 · 문서 · 값) 에 묶는다 — 한 문서에서 받은 승인이
@@ -773,7 +856,7 @@ def main():
     if os.path.exists(marker):
         # 치환이 있었으면 승인 히트에서도 updatedInput 을 내야 한다 —
         # 여기서 그냥 exit 0 하면 호스트가 원본(=마커 문자열)을 그대로 전송한다
-        emit_updated(tool_input) if did_expand else sys.exit(0)
+        passthru(tool_input, did_expand)
 
     body = "\n".join(f"  {v}" for _p, v in new_content)
     note = ""

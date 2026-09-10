@@ -707,6 +707,50 @@ def check_configs():
     check("훅이 가리키는 스크립트가 존재", True,
           os.path.isfile(os.path.join(ROOT, "core", "hangul_corruption_guard.py")))
 
+    # SessionStart — 리터럴 UTF-8 관행을 플러그인이 직접 배포한다(사용자 CLAUDE.md 편집 불필요)
+    start = hooks["hooks"].get("SessionStart") or [{}]
+    check("SessionStart 훅이 있다", True, bool(hooks["hooks"].get("SessionStart")))
+    # 컨텍스트가 비워지는 모든 지점에서 다시 주입해야 한다 — clear 를 빼면 /clear 뒤 세션은
+    # 1차 대응 없이 돈다. 2.1.267 의 source 집합은 startup·resume·clear·compact·fork 다.
+    matcher = start[0].get("matcher") or ""
+    for src in ("startup", "resume", "clear", "compact", "fork"):
+        check(f"  matcher 가 {src} 를 받는다", True, bool(_re.search(matcher, src)))
+    script = os.path.join(ROOT, "hooks", "session-start.sh")
+    check("  스크립트가 존재", True, os.path.isfile(script))
+    out = subprocess.run(["bash", script], capture_output=True, text=True,
+                         env={k: v for k, v in os.environ.items() if k != "HANGUL_GUARD"})
+    try:
+        payload = json.loads(out.stdout)["hookSpecificOutput"]
+    except Exception:
+        payload = {}
+    check("  출력이 SessionStart 스키마", "SessionStart", payload.get("hookEventName"))
+    ctx = payload.get("additionalContext") or ""
+    check("  리터럴 UTF-8 지시를 담는다", True, "리터럴 UTF-8" in ctx)
+    check("  마커 사용법을 담는다", True, "@@hangul:" in ctx)
+    # 표류는 MCP 파라미터에만 나는 게 아니다 — 기준본을 쓰는 Write·Bash 경로도 덮어야 한다
+    check("  MCP 밖 출력 경로도 덮는다", True, "Write" in ctx and "Bash" in ctx)
+    # 진짜 실패 모드는 이스케이프가 아니라 재생산이다
+    check("  원본 복사를 지시한다", True, "그대로 복사" in ctx)
+    # README 우선순위 3번(기계 생성 이스케이프)은 「금지」가 아니다 — 주입 문구가 그것을 뒤집으면 안 된다
+    check("  json.dumps 를 금지하지 않는다", False, "json.dumps" in ctx)
+    # 절차는 stage.md 가 갖는다 — 문구는 트리거와 포인터만 준다(매 세션 비용이라 중복은 손해다)
+    check("  절차서를 가리킨다", True, "/hangul-corruption-guard:stage" in ctx)
+    # 마커 경로는 staging 폴더 **기준 상대경로**다. 프로젝트 루트 기준 전체 경로를 쓰면 차단된다
+    check("  마커 경로 기준을 밝힌다", True, "폴더 기준 상대경로" in ctx)
+    check("  마커 예시가 상대경로다", True,
+          "@@hangul:target/" in ctx and "@@hangul:.claude" not in ctx)
+    check("  막혔을 때의 폴백을 준다", True, "리터럴 UTF-8 로 보낸다" in ctx)
+    check("  이스케이프가 리터럴로 보존된다", True, "\\uXXXX" in ctx)
+    # 매 세션 컨텍스트에 실리므로 짧아야 한다 — 늘어나면 이 상한을 의식적으로 올릴 것
+    check("  1000자 이내", True, 0 < len(ctx) <= 1000)
+    # README 가 off·0·false 를 약속하므로 셋 다 확인한다(코어와 같은 집합이어야 한다)
+    for val, want_quiet in (("off", True), ("OFF", True), ("0", True), ("false", True),
+                            ("False", True), ("no", False)):
+        r = subprocess.run(["bash", script], capture_output=True, text=True,
+                           env={**os.environ, "HANGUL_GUARD": val})
+        check(f"  HANGUL_GUARD={val} → {'무출력' if want_quiet else '주입'}",
+              want_quiet, r.stdout.strip() == "")
+
     events = {"cursor": "beforeMCPExecution", "windsurf": "pre_mcp_tool_use",
               "codex": "preToolUse"}
     for tool, event in events.items():

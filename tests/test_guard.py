@@ -402,6 +402,32 @@ def run():
             "tool_info": {"mcp_server_name": "browseros", "mcp_tool_name": "act",
                           "mcp_tool_arguments": {"text": DRIFT}}})[0])
 
+        # --- old_str 은 서버 본문 사본하고만 대조한다 ---
+        # target/(내 최종본)까지 후보에 넣으면 정확히 옮긴 앵커가 내 수정문과 닮았다는 이유로
+        # 차단되고, 메시지가 「기준본」이라며 내 수정문을 정답으로 내민다(실사용 재현).
+        SRV = "기능 권한을 하나로 합쳐야 한다"
+        MINE = SRV.replace("합쳐야", "합치게")          # 길이 같은 정상 수정
+        env.stage(**{"current__p.md": SRV + "\n", "target__p.md": MINE + "\n"})
+        check("정확한 old_str 이 내 최종본과 충돌하지 않는다", PASS, env.call(NOTION, upd(
+            content_updates=[{"old_str": SRV, "new_str": MINE}]))[0])
+        check("old_str 표류는 여전히 잡는다", BLOCK, env.call(NOTION, upd(
+            content_updates=[{"old_str": SRV.replace("합쳐야", "합쳤야"), "new_str": MINE}]))[0])
+
+        # 차단 메시지가 실제로 걸린 파일을 짚어야 한다 — 엉뚱한 마커를 권하면 편집이 no-op 이 된다
+        env.stage(**{"target__p.md": SRV + "\n"})
+        code, msg = env.call(NOTION, upd(
+            content_updates=[{"old_str": "x", "new_str": SRV.replace("뜬다", "뜼다")
+                              if "뜬다" in SRV else SRV.replace("합쳐야", "합쳤야")}]))
+        check("표류 차단이 걸린 기준본을 짚는다", BLOCK, code)
+        check("  target/ 에 걸리면 target/ 마커를 권한다", True, "@@hangul:target/p.md" in msg)
+
+        # current/ 만 있고 target/ 이 없으면, 손상된 서버본을 그대로 다시 보내라고 하면 안 된다
+        env.stage(**{"current__p.md": SRV + "\n"})
+        code, msg = env.call(NOTION, upd(
+            content_updates=[{"old_str": "x", "new_str": SRV.replace("합쳐야", "합쳤야")}]))
+        check("수습 안내가 함께 나온다", BLOCK, code)
+        check("  target/ 를 먼저 쓰라고 알려준다", True, "target/p.md 에 먼저 쓰세요" in msg)
+
         # --- staging 탐색은 cwd 에서 위로 (실측 함정: cd 한 번에 마커가 전량 거부됐다) ---
         def at_raw(cwd, tool_input, tool=JIRA, staging=None, home=None,
                    fresh=True, session="W"):

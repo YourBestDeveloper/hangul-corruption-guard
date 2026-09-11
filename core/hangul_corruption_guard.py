@@ -757,7 +757,10 @@ def main():
     known_norm = {n for n, _o in known}
     # 표류 대조는 **이 문서의** 기준본으로만 한다. 폴더 전체로 넓히면 무관한 문서의
     # 줄과 우연히 닮았다는 이유로 차단되고, 오류 메시지가 남의 문장을 정답으로 내민다.
-    reference = known
+    # 어느 파일에서 온 줄인지 함께 들고 있어야 차단 메시지가 **올바른 마커**를 낼 수 있다 —
+    # target/ 의 줄에 걸렸는데 current/ 마커를 권하면 편집이 통째로 no-op 이 된다.
+    reference = ([(n, o, "current") for n, o in current]
+                 + [(n, o, "target") for n, o in target])
 
     # (1a) 통짜 교체 커버리지 — 이 문서 기준본의 줄이 페이로드에 하나도 없으면 삭제된다
     if target:
@@ -812,12 +815,16 @@ def main():
             norm = normalize(line)
             if is_old:
                 check_old_str(path, line, norm)
+            # old_str 은 **서버 본문을 옮긴 것**이므로 current/ 하고만 대조한다. target/(내
+            # 최종본)까지 후보에 넣으면, 정확히 옮긴 앵커가 내 수정문과 길이·글자가 닮았다는
+            # 이유로 차단되고 메시지가 「기준본」이라며 **내 수정문을 정답으로 내민다.**
+            cands = [c for c in reference if c[2] == "current"] if is_old else reference
             # 조용히 통과시키는 것은 **이 문서의 기준본**에 있는 줄뿐이다.
             # 다른 파일은 표류 대조용으로만 쓴다 — 아무 파일에나 있으면 통과시키면
             # 한 번 스테이징한 문장이 모든 문서에 대한 영구 통행증이 된다.
             if norm in known_norm:
                 continue
-            for cand_norm, cand_orig in reference:
+            for cand_norm, cand_orig, role in cands:
                 if len(cand_norm) != len(norm):
                     continue
                 diffs = [(i, a, b) for i, (a, b) in enumerate(zip(cand_norm, norm)) if a != b]
@@ -828,11 +835,16 @@ def main():
                 deny(f"[{path}] 기준본과 길이가 같은데 {len(diffs)}글자가 다릅니다 — 표류로 보입니다.\n\n"
                      f"  기준본:  {cand_orig}\n  보낸 값: {line.strip()}\n\n"
                      + "\n".join(marks)
-                     + "\n\n이 값 전체가 기준본 파일의 한 구간과 같아질 수 있으면, 옮겨 적지 말고"
+                     + f"\n\n걸린 기준본은 `{role}/{ident}.md` 입니다."
+                       " 이 값 전체가 그 파일의 한 구간과 같아질 수 있으면, 옮겨 적지 말고"
                        " 마커로 보내세요\n"
-                       "  (파일 전체 @@hangul:current/<문서 id>.md@@"
-                       " · 줄 지정 @@hangul:current/<문서 id>.md#L12-L15@@).\n"
-                       "그렇지 않으면 기준본 쪽 문자열을 그대로 보내세요."
+                       f"  (파일 전체 @@hangul:{role}/{ident}.md@@"
+                       f" · 줄 지정 @@hangul:{role}/{ident}.md#L12-L15@@).\n"
+                     + ("의도한 수정이라면 **고친 본문을 target/" + str(ident) + ".md 에 먼저 쓰세요** —"
+                        " current/ 는 서버의 현재 본문이라 이미 손상이 들어 있을 수 있고,\n"
+                        "  그대로 다시 보내면 손상을 한 번 더 저장하게 됩니다.\n"
+                        if role == "current" and not target else "")
+                     + "그렇지 않으면 기준본 쪽 문자열을 그대로 보내세요."
                        " 의도한 수정이라면 기준본을 먼저 고치세요.\n"
                        "  ⚠️ 길이가 같은 정상 수정(가능하다→불가하다)도 여기 걸립니다."
                        " 오탐이면 기준본을 고치거나 HANGUL_GUARD=off 로 끄세요.\n")
